@@ -4,6 +4,19 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
+if (process.env.ENABLE_GOOGLE_CLOUD_PROFILER === "true") {
+    import("@google-cloud/profiler")
+        .then((profiler) =>
+            profiler.start({
+                serviceContext: {
+                    service: "server",
+                    version: process.env.VERSION,
+                },
+            }),
+        )
+        .catch((err) => console.error("failed to start cloud profiler", err));
+}
+
 //#region cpu profile
 /**
  * Make cpu profile by sending the server process a SIGINFO signal:
@@ -14,7 +27,6 @@
  * cpu profiles are written to tmp folder and have `.cpuprofile` extension.
  * Check server logs for the concrete filename.
  */
-
 import { Session } from "inspector";
 import * as fs from "fs";
 import * as os from "os";

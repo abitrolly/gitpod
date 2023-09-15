@@ -101,6 +101,11 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 				Name:  "WSMAN_CFG_MANAGERS",
 				Value: wsmanCfgManager,
 			},
+			{
+				Name: "ENABLE_GOOGLE_CLOUD_PROFILER",
+				// TODO(ak) add configuration, by default shoudl be false
+				Value: "true",
+			},
 		},
 	)
 
