@@ -5,8 +5,11 @@
 FROM node:18.17.1-slim as builder
 COPY components-server--app /installer/
 
-# Install Python for node-gyp
-RUN apt-get update && apt-get install -y python3 && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install Python, make, gcc and g++ for node-gyp
+RUN apt-get update && \
+    apt-get install -y python3 make gcc g++ && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 RUN /installer/install.sh
