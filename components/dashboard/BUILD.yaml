@@ -16,12 +16,16 @@ packages:
       - postcss.config.js
       - .eslintrc.js
       - scripts/run-integration-tests.sh
+      - config.json
     deps:
       - components/gitpod-protocol:lib
       - components/public-api/typescript:lib
     config:
       commands:
-        build: ["yarn", "build"]
+        build:
+         - sh
+         - -c
+         - yq w -i src/service/config.json commit commit-${__git_commit} -j && yarn build
         test: ["yarn", "test:unit"]
       yarnLock: ${coreYarnLockBase}/yarn.lock
       dontTest: false

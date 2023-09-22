@@ -4,6 +4,7 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
+import { metricsReporter } from "./ide-metrics-service-client";
 import ReconnectingWebSocket from "reconnecting-websocket";
 import { Disposable } from "@gitpod/gitpod-protocol/lib/util/disposable";
 
@@ -31,12 +32,15 @@ class IDEWebSocket extends ReconnectingWebSocket {
             maxRetries: 0,
             connectionTimeout: 2147483647, // disable connection timeout, clients should handle it
         });
+        let origin = "unknown";
         if (isWorkspaceOrigin(url)) {
+            origin = "websocket";
             workspaceSockets.add(this);
             this.addEventListener("close", () => {
                 workspaceSockets.delete(this);
             });
         }
+        metricsReporter.instrumentWebSocket(this as any, origin);
     }
     static disconnectWorkspace(): void {
         for (const socket of workspaceSockets) {

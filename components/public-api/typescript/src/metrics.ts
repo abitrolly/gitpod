@@ -52,6 +52,8 @@ class PrometheusClientCallMetrics {
     readonly handledCounter: PromCounter<string>;
     readonly handledSecondsHistogram: PromHistorgram<string>;
 
+    readonly webSocketCounter: PromCounter<string>;
+
     constructor() {
         this.startedCounter = new Counter({
             name: "grpc_client_started_total",
@@ -82,6 +84,13 @@ class PrometheusClientCallMetrics {
             help: "Histogram of response latency (seconds) of the gRPC until it is finished by the application.",
             labelNames: ["grpc_service", "grpc_method", "grpc_type", "grpc_code"],
             buckets: [0.1, 0.2, 0.5, 1, 2, 5, 10], // it should be aligned with https://github.com/gitpod-io/gitpod/blob/84ed1a0672d91446ba33cb7b504cfada769271a8/install/installer/pkg/components/ide-metrics/configmap.go#L315
+            registers: [register],
+        });
+
+        this.webSocketCounter = new Counter({
+            name: "websocket_client_total",
+            help: "Total number of WebSocket connections by the client",
+            labelNames: ["origin", "status", "code", "was_clean"],
             registers: [register],
         });
     }
@@ -140,7 +149,7 @@ class PrometheusClientCallMetrics {
     }
 }
 
-const GRPCMetrics = new PrometheusClientCallMetrics();
+const metrics = new PrometheusClientCallMetrics();
 
 export function getMetricsInterceptor(): Interceptor {
     const getLabels = (req: UnaryRequest | StreamRequest): IGrpcCallMetricsLabels => {
@@ -185,14 +194,14 @@ export function getMetricsInterceptor(): Interceptor {
             } finally {
                 if (handleMetrics && !settled) {
                     stopTimer({ grpc_code: status ? Code[status] : "OK" });
-                    GRPCMetrics.handled({ ...labels, code: status ? Code[status] : "OK" });
+                    metrics.handled({ ...labels, code: status ? Code[status] : "OK" });
                 }
             }
         }
 
         const labels = getLabels(req);
-        GRPCMetrics.started(labels);
-        const stopTimer = GRPCMetrics.startHandleTimer(labels);
+        metrics.started(labels);
+        const stopTimer = metrics.startHandleTimer(labels);
 
         let settled = false;
         let status: Code | undefined;
@@ -203,11 +212,7 @@ export function getMetricsInterceptor(): Interceptor {
             } else {
                 request = {
                     ...req,
-                    message: incrementStreamMessagesCounter(
-                        req.message,
-                        GRPCMetrics.sent.bind(GRPCMetrics, labels),
-                        false,
-                    ),
+                    message: incrementStreamMessagesCounter(req.message, metrics.sent.bind(metrics, labels), false),
                 };
             }
 
@@ -220,11 +225,7 @@ export function getMetricsInterceptor(): Interceptor {
             } else {
                 response = {
                     ...res,
-                    message: incrementStreamMessagesCounter(
-                        res.message,
-                        GRPCMetrics.received.bind(GRPCMetrics, labels),
-                        true,
-                    ),
+                    message: incrementStreamMessagesCounter(res.message, metrics.received.bind(metrics, labels), true),
                 };
             }
 
@@ -237,11 +238,13 @@ export function getMetricsInterceptor(): Interceptor {
         } finally {
             if (settled) {
                 stopTimer({ grpc_code: status ? Code[status] : "OK" });
-                GRPCMetrics.handled({ ...labels, code: status ? Code[status] : "OK" });
+                metrics.handled({ ...labels, code: status ? Code[status] : "OK" });
             }
         }
     };
 }
+
+export type MetricsRequest = RequestInit & { url: string };
 
 export class MetricsReporter {
     private static readonly REPORT_INTERVAL = 10000;
@@ -250,6 +253,10 @@ export class MetricsReporter {
 
     private readonly metricsHost: string;
 
+    private sendQueue = Promise.resolve();
+
+    private readonly pendingRequests: MetricsRequest[] = [];
+
     constructor(
         private readonly options: {
             gitpodUrl: string;
@@ -257,9 +264,14 @@ export class MetricsReporter {
             clientVersion: string;
             logError: typeof console.error;
             isEnabled: () => Promise<boolean>;
+            commonErrorDetails: { [key: string]: string | undefined };
         },
     ) {
         this.metricsHost = `ide.${new URL(options.gitpodUrl).hostname}`;
+    }
+
+    updateCommonErrorDetails(update: { [key: string]: string | undefined }) {
+        Object.assign(this.options.commonErrorDetails, update);
     }
 
     startReporting() {
@@ -283,6 +295,7 @@ export class MetricsReporter {
         if (!enabled) {
             return;
         }
+
         const metrics = await register.getMetricsAsJSON();
         register.resetMetrics();
         for (const m of metrics) {
@@ -298,16 +311,25 @@ export class MetricsReporter {
                 this.syncReportHistogram(m);
             }
         }
+
+        while (this.pendingRequests.length) {
+            const request = this.pendingRequests.shift();
+            if (request) {
+                this.send(request);
+            }
+        }
     }
 
     private syncReportCounter(metric: MetricObjectWithValues<MetricValue<string>>) {
         for (const { value, labels } of metric.values) {
             if (value > 0) {
-                this.post("metrics/counter/add/" + metric.name, {
-                    name: metric.name,
-                    labels,
-                    value,
-                });
+                this.push(
+                    this.create("metrics/counter/add/" + metric.name, {
+                        name: metric.name,
+                        labels,
+                        value,
+                    }),
+                );
             }
         }
     }
@@ -330,13 +352,15 @@ export class MetricsReporter {
                 sum = value;
             } else if (metricName.endsWith("_count")) {
                 if (value > 0) {
-                    this.post("metrics/histogram/add/" + metric.name, {
-                        name: metric.name,
-                        labels,
-                        count: value,
-                        sum,
-                        buckets,
-                    });
+                    this.push(
+                        this.create("metrics/histogram/add/" + metric.name, {
+                            name: metric.name,
+                            labels,
+                            count: value,
+                            sum,
+                            buckets,
+                        }),
+                    );
                 }
                 sum = 0;
                 buckets = [];
@@ -369,7 +393,7 @@ export class MetricsReporter {
         if (!enabled) {
             return;
         }
-        const properties = { ...data };
+        const properties = { ...data, ...this.options.commonErrorDetails };
         properties["error_name"] = error.name;
         properties["error_message"] = error.message;
 
@@ -381,20 +405,23 @@ export class MetricsReporter {
         delete properties["instanceId"];
         delete properties["userId"];
 
-        await this.post("reportError", {
-            component: this.options.clientName,
-            errorStack: error.stack ?? String(error),
-            version: this.options.clientVersion,
-            workspaceId: workspaceId ?? "",
-            instanceId: instanceId ?? "",
-            userId: userId ?? "",
-            properties,
-        });
+        await this.send(
+            this.create("reportError", {
+                component: this.options.clientName,
+                errorStack: error.stack ?? String(error),
+                version: this.options.clientVersion,
+                workspaceId: workspaceId ?? "",
+                instanceId: instanceId ?? "",
+                userId: userId ?? "",
+                properties,
+            }),
+        );
     }
 
-    private async post(endpoint: string, data: any): Promise<void> {
+    private create(endpoint: string, data: any): MetricsRequest | undefined {
         try {
-            const response = await fetch(`https://${this.metricsHost}/metrics-api/` + endpoint, {
+            return <MetricsRequest>{
+                url: `https://${this.metricsHost}/metrics-api/` + endpoint,
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -403,13 +430,60 @@ export class MetricsReporter {
                 },
                 body: JSON.stringify(data),
                 credentials: "omit",
-            });
-
-            if (!response.ok) {
-                this.options.logError(`metrics: endpoint responded with ${response.status} ${response.statusText}`);
-            }
+            };
         } catch (e) {
-            this.options.logError("metrics: failed to post", e);
+            this.options.logError("metrics: failed to create request", e);
+            return undefined;
         }
+    }
+
+    private push(request: MetricsRequest | undefined): void {
+        if (!request) {
+            return;
+        }
+        this.pendingRequests.push(request);
+    }
+
+    private async send(request: MetricsRequest | undefined): Promise<void> {
+        if (!request) {
+            return request;
+        }
+        this.sendQueue = this.sendQueue.then(async () => {
+            try {
+                const response = await fetch(request.url, request);
+                if (!response.ok) {
+                    this.options.logError(`metrics: endpoint responded with ${response.status} ${response.statusText}`);
+                }
+            } catch (e) {
+                this.options.logError("metrics: failed to post, trying again next time", e);
+                this.push(request);
+            }
+        });
+        await this.sendQueue;
+    }
+
+    instrumentWebSocket(ws: WebSocket, origin: string) {
+        metrics.webSocketCounter.labels({ origin, status: "new" }).inc();
+        ws.addEventListener("open", () => {
+            metrics.webSocketCounter.labels({ origin, status: "open" }).inc();
+        });
+        ws.addEventListener("error", (event) => {
+            metrics.webSocketCounter.labels({ origin, status: "error" }).inc();
+            this.reportError(new Error(`WebSocket failed: ${String(event)}`));
+        });
+        ws.addEventListener("close", (event) => {
+            metrics.webSocketCounter.labels({
+                origin,
+                status: "close",
+                code: String(event.code),
+                was_clean: String(Number(event.wasClean)),
+            });
+            if (!event.wasClean) {
+                this.reportError(new Error("WebSocket was not closed cleanly"), {
+                    code: String(event.code),
+                    reason: event.reason,
+                });
+            }
+        });
     }
 }
